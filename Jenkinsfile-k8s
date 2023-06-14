@@ -1,0 +1,246 @@
+#!/usr/bin/env groovy
+
+
+pipeline {
+    agent {
+        node {
+            label 'docker-node'
+        }
+    }
+    environment {
+        DOCKERHUB_ACCOUNT = "wtvglobalproductdevelopment"
+	DOCKER_PASS = credentials('DOCKER_PASS') 
+        GIT_REPO_NAME = env.GIT_URL.replaceFirst(/^.*\/([^\/]+?).git$/, '$1')
+	FAST_PATH = sh(script: "export DOCKER_USERNAME=wtvglobalproductdevelopment && export DOCKER_PASSWORD='${DOCKER_PASS}' && fastpath --verbose HEAD '${DOCKERHUB_ACCOUNT}'/'${GIT_REPO_NAME}'", returnStdout: true).trim()
+	GIT_REVISION = "${sh(returnStdout: true, script: 'git rev-parse HEAD').trim()}"
+	DEPLOY_TAG = "${env.DOCKERHUB_ACCOUNT}/${env.GIT_REPO_NAME}:${env.GIT_REVISION}"
+	COMMIT_MESSAGE = "${sh(returnStdout: true, script: 'git log -1 --pretty=format:"%s"').trim()}"
+	STATUS = '$BUILD_STATUS'   
+	GIT_USER =  "${sh(returnStdout: true, script: 'git log -1 --pretty=format:"%an"').trim()}"
+    }
+    stages {
+        stage ('Checkout') {
+            when {
+                   anyOf {
+                     branch 'develop';
+                     branch 'staging';
+		     tag 'v*'
+                   }
+            }
+            steps {
+                checkout scm: [
+                    $class: 'GitSCM',
+                    branches: scm.branches,
+                    doGenerateSubmoduleConfigurations: scm.doGenerateSubmoduleConfigurations,
+                    extensions: [[$class: 'CloneOption', noTags: false, shallow: false, depth: 0, reference: '']],
+                    userRemoteConfigs: scm.userRemoteConfigs
+                ]
+            }
+              }
+        stage ('Package') {
+            agent {
+                docker {
+                    label 'docker-node'
+                    reuseNode true
+                    image 'wtvglobalproductdevelopment/wtv-jenkins-slave-maven:3.8.6-openjdk-18-slim'
+                    registryUrl 'https://registry.hub.docker.com'
+                    registryCredentialsId 'Dockerhub'
+                    alwaysPull true
+                }
+            }
+            when {
+                   anyOf {
+                     branch 'develop';
+                   }
+            }
+            steps {
+                script {
+	     env.MVN_VERSION = sh(script: "mvn org.apache.maven.plugins:maven-help-plugin:3.1.1:evaluate -Dexpression=project.version -q -DforceStdout", returnStdout: true).trim()
+           if (env.FAST_PATH == null ) {
+             echo "New code. Building..."
+             sh "mvn clean package -Dmaven.test.skip=true"
+           } else {
+             DEPLOY_TAG = "${env.DOCKERHUB_ACCOUNT}/${env.GIT_REPO_NAME}:${env.FAST_PATH}"
+             echo "Found a suitable package image: ${DEPLOY_TAG}"
+           }
+         }
+        }
+        }
+        stage ('Build') {
+            when {
+                   anyOf {
+                     branch 'develop';
+                   }
+            }
+            steps {
+                println "Building version: ${env. GIT_TAG}"
+                script {
+			wrap([$class: 'BuildUser']) {
+		    	    if (env.BUILD_USER == null ) {
+	    	env.USER = "${sh(returnStdout: true, script: 'git log -1 --pretty=format:"%an"').trim()}"
+	    } else {
+		env.USER = env.BUILD_USER
+	    }
+                    env.CONFIG_ENV = "${env.GIT_BRANCH == 'develop' ? 'DEV' : 'STG'}"
+		    sh "docker build --tag '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':'${env.GIT_REVISION}' ."
+		    sh "docker build --tag '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':'${env.MVN_VERSION}' ."
+					if (env.FAST_PATH == null ) {
+                    if (env.GIT_BRANCH == 'develop') {
+                        sh "docker build --tag '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':'${env.GIT_REVISION}'-DEV ."
+                    } else if (env.GIT_BRANCH == 'staging') {
+		        sh "docker build --tag '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':'${env.GIT_REVISION}'-STG ."    
+		    } else {
+			sh "docker build --tag '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':${env.GIT_BRANCH} ."    
+		    } 
+		    } else {
+				DEPLOY_TAG = "$DOCKERHUB_ACCOUNT/$GIT_REPO_NAME:${env.FAST_PATH}"
+				echo "Found a suitable image: ${DEPLOY_TAG}"
+						}
+					}
+				}
+			}
+	}
+        stage ('Push') {
+            when {
+                   anyOf {
+                     branch 'develop';
+                     branch 'staging';
+		             tag 'v*'
+                   }
+            }
+            steps {
+                script {
+			env.CONFIG_ENV = "${env.GIT_BRANCH == 'develop' ? 'DEV' : 'STG'}"
+		       env.MVN_VERSION = sh(script: "grep '<version>' pom.xml | awk -F'[><]' '{print \$3}' | grep SNAPSHOT", returnStdout: true).trim()
+				    if ( env.FAST_PATH == null ) {
+                    if (env.GIT_BRANCH == 'develop') {
+			sh "docker push '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':'${env.GIT_REVISION}'"
+			sh "docker push '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':'${env.MVN_VERSION}'"
+                        sh "docker push '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':'${env.GIT_REVISION}'-DEV"
+                    } else if (env.GIT_BRANCH == 'staging') {
+			sh "docker pull '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':'${env.MVN_VERSION}'"
+			sh "docker tag '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':'${env.MVN_VERSION}' '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':'${env.GIT_REVISION}'-STG"
+		        sh "docker push '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':'${env.GIT_REVISION}'-STG"
+		    } else {
+			sh "docker pull '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':'${env.MVN_VERSION}'"
+			sh "docker tag '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':'${env.MVN_VERSION}' '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':${env.TAG_NAME}"
+			sh "docker push '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':${env.TAG_NAME}"  
+		    }
+			} else {
+                DEPLOY_TAG = "$DOCKERHUB_ACCOUNT/$GIT_REPO_NAME:${env.FAST_PATH}"
+				echo "Found a suitable image: ${DEPLOY_TAG}"
+                    if (env.GIT_BRANCH == 'develop') {
+			sh "docker pull '${DEPLOY_TAG}'"
+			sh "docker tag '${DEPLOY_TAG}' '${DEPLOY_TAG}-DEV'"
+		    sh "docker push '${DEPLOY_TAG}-DEV'"
+                    } else if (env.GIT_BRANCH == 'staging') {
+			sh "docker pull '${DEPLOY_TAG}'"
+			sh "docker tag '${DEPLOY_TAG}' '${DEPLOY_TAG}-STG'"
+		    sh "docker push '${DEPLOY_TAG}-STG'"
+		    } else {
+			sh "docker pull '${DEPLOY_TAG}'"
+			sh "docker tag '${DEPLOY_TAG}' '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':${env.TAG_NAME}"  
+		    sh "docker push '${env.DOCKERHUB_ACCOUNT}'/'${env.GIT_REPO_NAME}':${env.TAG_NAME}" 
+		    }
+            }
+                } 
+            }
+        }
+        stage ('Deploy to dev') {
+            environment {
+                NAMESPACE = 'sharestudio-dev'
+                CHART = 'webcast-management-service'
+                CHARTS_DIR = "${sh(script:'mktemp -d | xargs echo -n', returnStdout: true)}"
+                TOKEN = credentials('k8s-token')
+            }
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    println "Deploying ${env.GIT_BRANCH} branch to ${env.SERVER}"
+                    sh(script: """
+                         git clone https://ctvient28:${env.TOKEN}@github.com/world-television/wtv.helmcharts -b main ${env.CHARTS_DIR}
+                         echo ${env.CHARTS_DIR}/
+			""")
+			 if (env.FAST_PATH == null ) {
+                        sh "KUBECONFIG=${env.CHARTS_DIR}/k8s.yml /usr/local/bin/helm upgrade -f ${env.CHARTS_DIR}/charts/${env.CHART}/values-dev.yaml --debug --history-max=3 --install --set image.tag='${env.GIT_REVISION}'-${CONFIG_ENV} --namespace=${env.NAMESPACE} --timeout=10m0s --wait=true ${env.CHART} ${env.CHARTS_DIR}/charts/${env.CHART}"
+			} else {
+			sh "KUBECONFIG=${env.CHARTS_DIR}/k8s.yml /usr/local/bin/helm upgrade -f ${env.CHARTS_DIR}/charts/${env.CHART}/values-dev.yaml --debug --history-max=3 --install --set image.tag='${env.FAST_PATH}'-${CONFIG_ENV} --namespace=${env.NAMESPACE} --timeout=10m0s --wait=true ${env.CHART} ${env.CHARTS_DIR}/charts/${env.CHART}"
+			}
+		        sh "rm -rf ${env.CHARTS_DIR}"
+                }
+            }
+        }
+        stage ('Deploy to staging ') {
+            environment {
+                NAMESPACE = 'sharestudio-stg'
+                CHART = 'webcast-management-service'
+                CHARTS_DIR = "${sh(script:'mktemp -d | xargs echo -n', returnStdout: true)}"
+                TOKEN = credentials('k8s-token')
+            }
+            when {
+                branch 'staging'
+            }
+            steps {
+                script {
+                    println "Deploying ${env.GIT_BRANCH} branch to ${env.SERVER}"
+                    sh(script: """
+                         git clone https://ctvient28:${env.TOKEN}@github.com/world-television/wtv.helmcharts -b main ${env.CHARTS_DIR}
+                         echo ${env.CHARTS_DIR}/
+			""")
+			 if (env.FAST_PATH == null ) {
+                        sh "KUBECONFIG=${env.CHARTS_DIR}/k8s.yml /usr/local/bin/helm upgrade -f ${env.CHARTS_DIR}/charts/${env.CHART}/values-stg.yaml --debug --history-max=3 --install --set image.tag='${env.GIT_REVISION}'-${CONFIG_ENV} --namespace=${env.NAMESPACE} --timeout=10m0s --wait=true ${env.CHART} ${env.CHARTS_DIR}/charts/${env.CHART}"
+			} else {
+			sh "KUBECONFIG=${env.CHARTS_DIR}/k8s.yml /usr/local/bin/helm upgrade -f ${env.CHARTS_DIR}/charts/${env.CHART}/values-stg.yaml --debug --history-max=3 --install --set image.tag='${env.FAST_PATH}'-${CONFIG_ENV} --namespace=${env.NAMESPACE} --timeout=10m0s --wait=true ${env.CHART} ${env.CHARTS_DIR}/charts/${env.CHART}"
+			}
+		        sh "rm -rf ${env.CHARTS_DIR}"
+                }
+            }
+        }
+        stage ('Deploy to prod') {
+            environment {
+                NAMESPACE ='connectstudio'
+                CHART = 'webcast-management-service'
+                CHARTS_DIR = "${sh(script:'mktemp -d | xargs echo -n', returnStdout: true)}"
+                TOKEN = credentials('k8s-token')
+            }
+            when { tag "v*" }
+            steps {
+                script {
+                    println "Deploying ${env.GIT_BRANCH} branch to ${env.SERVER}"
+                    sh(script: """
+                         git clone https://ctvient28:${env.TOKEN}@github.com/world-television/wtv.helmcharts -b main ${env.CHARTS_DIR}
+                         echo ${env.CHARTS_DIR}/
+                         export KUBECONFIG=${env.CHARTS_DIR}/k8s-prod.yml
+			 sed -i 's#GIT_REVISION#${env.GIT_REVISION}#g' ${env.CHARTS_DIR}/charts/${env.CHART}/values-prod.yaml
+                        /usr/local/bin/helm upgrade -f ${env.CHARTS_DIR}/charts/${env.CHART}/values-prod.yaml --debug --history-max=3 --install --set image.tag='${env.GIT_BRANCH}' --namespace=${env.NAMESPACE} --timeout=10m0s --wait=true ${env.CHART} ${env.CHARTS_DIR}/charts/${env.CHART}
+		        rm -rf ${env.CHARTS_DIR}
+                    """)
+                }
+            }
+        }
+    }
+    post {
+        always {
+		    script {
+			if (env.GIT_BRANCH  == 'develop' || env.GIT_BRANCH  == 'staging' || env.GIT_BRANCH ==~ /v(.+)/) {
+            googlechatnotification (
+		        message: "[${env.STATUS}] after ${currentBuild.durationString.replace(' and counting', '')} by ${env.USER} ${BUILD_URL} (Commit Message: ${env.COMMIT_MESSAGE})",
+                url: 'https://chat.googleapis.com/v1/spaces/AAAAp1kMdNc/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=ZS14gZ4j5u--OCo3q4LodPYSt02xbUs3h9ggGZu5hT0%3D',
+                notifyAborted: true,
+                notifyBackToNormal: true,
+                notifyFailure: true,
+                notifyNotBuilt: true,
+                notifySuccess: true,
+                notifyUnstable: true,
+                sameThreadNotification: true,
+                suppressInfoLoggers: true
+            )
+         } else {
+	      echo "not branch"
+	    }
+	   }
+     }
+   }
+}
